@@ -12,7 +12,7 @@ import db
 import simulator
 import store
 
-PAGES = ["overview", "entry", "spc", "oee", "defects", "live_monitor"]
+PAGES = ["overview", "entry", "spc", "oee", "defects", "live_monitor", "ai_insights"]
 
 
 @pytest.fixture(scope="module")
@@ -155,3 +155,16 @@ def test_live_page_streams_readings_and_shows_a_fault_as_an_alarm(demo_db):
     assert live.count_simulated() == 0                 # removed, and not re-added
     assert at.toggle(key="live_stream").value is False  # the stream was switched off
     assert at.success and "Removed" in at.success[0].value
+
+
+def test_ai_insights_shows_anomalies_for_each_line(demo_db):
+    at = run_app()
+    at.switch_page("views/ai_insights.py").run()
+    assert not at.exception
+    assert len(at.tabs) == 2                              # one tab per line
+    assert len(at.get("plotly_chart")) == 2
+    labels = {m.label for m in at.metric}
+    assert {"SPC alarm events", "AI anomaly events"} <= labels
+    at.sidebar.selectbox(key="flt_line").select("Line 1").run()
+    assert not at.exception
+    assert len(at.get("plotly_chart")) == 1

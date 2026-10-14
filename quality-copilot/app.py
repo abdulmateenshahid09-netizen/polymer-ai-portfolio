@@ -12,6 +12,7 @@ pages = [
     st.Page("views/live_monitor.py", title="Live monitor", icon=":material/sensors:"),
     st.Page("views/oee.py", title="OEE", icon=":material/precision_manufacturing:"),
     st.Page("views/defects.py", title="Defects", icon=":material/bug_report:"),
+    st.Page("views/ai_insights.py", title="AI insights", icon=":material/psychology:"),
 ]
 page = st.navigation(pages)
 with st.sidebar:
