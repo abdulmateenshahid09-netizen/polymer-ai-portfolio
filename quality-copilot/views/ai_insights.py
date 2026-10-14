@@ -1,4 +1,4 @@
-"""AI insights: anomalies next to SPC alarms, and the off-target risk model against simple rules."""
+"""AI insights: anomalies, off-target risk model against simple rules, and haul-off advice."""
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -8,6 +8,8 @@ import ui
 from ai.anomaly import anomaly_events, detect_anomalies
 from ai.risk_model import (FEATURES, HORIZON, K_SIGMA, SETTINGS, build_dataset, compare_verdict,
                            feature_importance, naive_scores, score_report, time_split, train_model)
+from ai.recommender import (ALPHA, ewma_state, fit_and_validate, margin_sigmas, predict_thickness,
+                            prepare, recommend_settings, residuals)
 from metrics.spc import alarm_events, spc_summary
 
 BASELINE_READINGS = 480
@@ -228,3 +230,125 @@ else:
             st.write("What the model leaned on most (share of its decisions):")
             st.dataframe(risk["importance"].round(3).rename("importance").reset_index()
                          .rename(columns={"index": "input"}), hide_index=True)
+
+
+# ---------------------------------------------------------------- 3. settings recommender
+@st.cache_data(show_spinner="Fitting the process model ...")
+def fit_recommender(wall_df, process_df):
+    """Fit the physics-based process model on the first 20 days and validate it on the rest."""
+    frames = {}
+    for line, g in wall_df.groupby("line"):
+        f = prepare(g[["timestamp", "value"]],
+                    process_df[process_df["line"] == line][["timestamp"] + SETTINGS])
+        f = f.dropna().reset_index(drop=True)
+        if len(f):
+            frames[line] = f
+    if not frames:
+        raise ValueError("No line has wall thickness readings together with process settings")
+    model, report = fit_and_validate(frames)
+    return frames, model, report
+
+
+def show_recommender(frames, model, report, target):
+    st.subheader("How well does the process model predict?")
+    st.dataframe(pd.DataFrame([
+        {"predictor": "Process model",
+         "error, all readings (mm)": round(report["mae_model"], 3),
+         "error, after a haul-off change (mm)": round(report["mae_model_haul_change"], 3)},
+        {"predictor": "Next = last reading",
+         "error, all readings (mm)": round(report["mae_persistence"], 3),
+         "error, after a haul-off change (mm)": round(report["mae_persistence_haul_change"], 3)},
+    ]), hide_index=True)
+    better = report["mae_model"] < report["mae_persistence"]
+    text = (f"Tested on {report['n_test']} readings the model has never seen "
+            f"({report['n_haul_changes']} right after a haul-off change). Typical prediction "
+            f"error (1 sigma): {report['sigma_mm']:.3f} mm. The model learned that melt "
+            f"temperature changes the output by {model['melt_coef'] * 100:+.2f} % per degree C "
+            f"and the resin MFR by {model['mfr_coef'] * 10:+.1f} % per 0.10 MFR unit.")
+    (st.success if better else st.warning)(
+        ("It predicts better than 'next = last reading'. " if better else
+         "It does NOT predict better than 'next = last reading'. ") + text)
+
+    st.subheader("Ask for advice")
+    c1, c2, c3, c4 = st.columns(4)
+    names = sorted(frames)
+    start = names.index(filters["line"]) if filters["line"] in frames else 0
+    line = c1.selectbox("Line", names, index=start, key="rec_line")
+    full = frames[line]
+    stamps = list(full["timestamp"].iloc[::-1].head(96))          # the last 48 hours
+    when = c2.selectbox("Moment", stamps, key=f"rec_time_{line}",
+                        format_func=lambda t: f"{t:%Y-%m-%d %H:%M}")
+    max_change = float(c3.number_input("Largest change allowed (%)", 1.0, 10.0, 5.0, 0.5,
+                                       key="rec_max"))
+    allow_rpm = c4.checkbox("Allow screw rpm to change too", key="rec_rpm")
+
+    pos = int(full.index[full["timestamp"] == when][0])
+    row = full.iloc[pos]
+    state = ewma_state(residuals(model, full.iloc[:pos + 1]), ALPHA)
+    pred_now = float(predict_thickness(model, state, row["screw_rpm"], row["haul_speed_mpm"],
+                                       row["melt_temp_c"], row["mfr"]))
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Measured thickness", f"{row['value']:.2f} mm")
+    k2.metric("Predicted at current settings", f"{pred_now:.2f} mm")
+    k3.metric("Current haul-off speed", f"{row['haul_speed_mpm']:.4f} m/min")
+    k4.metric("Distance to nearest limit now",
+              f"{margin_sigmas(pred_now, lsl, usl, report['sigma_mm']):.1f} sigma")
+
+    signature = (line, str(when), max_change, allow_rpm)
+    if st.button("Get advice", key="rec_go"):
+        rec = recommend_settings(model, state, row["melt_temp_c"], row["mfr"], row["screw_rpm"],
+                                 row["haul_speed_mpm"], target, lsl, usl, report["sigma_mm"],
+                                 max_change_pct=max_change, allow_rpm=allow_rpm)
+        st.session_state["rec_out"] = {"signature": signature, "rec": rec}
+    out = st.session_state.get("rec_out")
+    if out and out["signature"] == signature:
+        rec = out["rec"]
+        st.subheader("Advice")
+        a1, a2, a3, a4 = st.columns(4)
+        a1.metric("New haul-off speed", f"{rec['haul']:.4f} m/min",
+                  f"{rec['haul_change_pct']:+.1f} %", delta_color="off")
+        if allow_rpm:
+            a2.metric("New screw rpm", f"{rec['rpm']:.1f}", f"{rec['rpm_change_pct']:+.1f} %",
+                      delta_color="off")
+        a3.metric("Predicted thickness after change", f"{rec['predicted_new']:.2f} mm",
+                  f"target {target:.2f} mm", delta_color="off", delta_arrow="off")
+        a4.metric("Distance to nearest limit", f"{rec['margin_sigmas']:.1f} sigma")
+        if abs(rec["haul_change_pct"]) < 0.1 and abs(rec["rpm_change_pct"]) < 0.1:
+            st.success("No change needed: the predicted thickness is already close to the target.")
+        elif rec["reached_target"]:
+            st.success("The change is predicted to bring the wall thickness to the target.")
+        elif rec["at_limit"]:
+            st.warning("The largest allowed change is used up and the target is still not "
+                       "reached. A bigger change, or another cause (melt temperature, resin, "
+                       "hopper), needs a supervised trial.")
+        else:
+            st.info("The change moves the wall thickness towards the target but does not reach it.")
+    st.warning("Demo data only. The advice is validated only as a thickness PREDICTION on held-out "
+               "data. Following it was never tested on a real line, so any real use needs "
+               "supervised trials first.")
+
+
+st.header("3. Settings recommender: haul-off speed")
+st.write("Physics first: a mass balance links extruder output, haul-off speed and wall thickness. "
+         "The data teaches only how output depends on melt temperature and resin MFR, and a "
+         "slowly drifting efficiency is tracked from the latest readings. A search then finds "
+         "the smallest haul-off change that brings the wall thickness to the target.")
+if len(process) == 0:
+    st.info("No process settings are stored yet, so there is nothing to base advice on.")
+elif lsl is None or usl is None:
+    st.info("Specification limits (both lower and upper) are needed for wall thickness. "
+            "Add them under Data entry > Specifications.")
+else:
+    target = spec_row.iloc[0]["target"]
+    target = (lsl + usl) / 2.0 if pd.isna(target) else float(target)
+    try:
+        frames, rec_model, rec_report = fit_recommender(
+            wall[["timestamp", "line", "value", "shift"]], process[["timestamp", "line"] + SETTINGS])
+    except ValueError as error:
+        st.info(f"The recommender cannot run yet: {error}.")
+        rec_report = None
+    if rec_report is not None and rec_report["n_test"] == 0:
+        st.info("The recommender needs more than 20 days of data, so that it can be checked on "
+                "readings it has not seen. Without that check no advice is shown.")
+    elif rec_report is not None:
+        show_recommender(frames, rec_model, rec_report, target)

@@ -169,6 +169,7 @@ def test_ai_insights_shows_anomalies_for_each_line(demo_db):
     assert not at.exception
     assert len(at.get("plotly_chart")) == 1
 
+
 def test_ai_insights_risk_section_is_honest_about_the_model(demo_db):
     at = run_page("ai_insights")
     assert not at.exception
@@ -194,3 +195,66 @@ def test_ai_insights_with_too_few_readings_shows_messages_not_errors(tmp_path, m
     assert not at.exception
     assert any("At least" in i.value for i in at.info)         # anomaly section: not enough readings
     assert any("No process settings" in i.value for i in at.info)   # risk section: no process log
+
+
+def _metric(at, label):
+    return [m.value for m in at.metric if m.label == label][0]
+
+
+def test_ai_insights_recommender_validates_first_and_then_advises_within_limits(demo_db):
+    at = run_page("ai_insights")
+    assert not at.exception
+    check = [d.value for d in at.dataframe if "predictor" in d.value.columns][0]
+    assert list(check["predictor"]) == ["Process model", "Next = last reading"]
+    assert check["error, all readings (mm)"][0] < check["error, all readings (mm)"][1]
+    assert any("It predicts better" in s.value for s in at.success)
+    assert not any(s.value == "Advice" for s in at.subheader)          # nothing before the click
+
+    current = float(_metric(at, "Current haul-off speed").split()[0])
+    [b for b in at.button if b.label == "Get advice"][0].click()
+    at.run()
+    assert not at.exception
+    assert any(s.value == "Advice" for s in at.subheader)
+    new = float(_metric(at, "New haul-off speed").split()[0])
+    assert abs(new / current - 1) <= 0.05 + 1e-9                       # never beyond the limit
+    assert 10.0 < float(_metric(at, "Predicted thickness after change").split()[0]) < 11.1
+    assert any("Demo data only" in w.value for w in at.warning)
+
+
+def test_ai_insights_says_so_when_the_allowed_change_is_not_enough(demo_db):
+    m = db.read_table("measurements")
+    m = m[(m["line"] == "Line 1") & (m["characteristic"] == "wall_thickness")]
+    last = m.sort_values("timestamp", ascending=False).head(96).reset_index(drop=True)
+    worst = int((last["value"] - 10.4).abs().idxmax())
+    assert abs(last.loc[worst, "value"] - 10.4) > 0.25                 # a really off-target moment
+    at = run_page("ai_insights")
+    at.selectbox(key="rec_line").select("Line 1").run()
+    at.selectbox(key="rec_time_Line 1").select_index(worst).run()
+    at.number_input(key="rec_max").set_value(1.0).run()
+    [b for b in at.button if b.label == "Get advice"][0].click()
+    at.run()
+    assert not at.exception
+    assert any("largest allowed change is used up" in w.value for w in at.warning)
+    new = float(_metric(at, "New haul-off speed").split()[0])
+    now = float(_metric(at, "Current haul-off speed").split()[0])
+    assert abs(new / now - 1) <= 0.01 + 1e-9
+
+
+def test_ai_insights_with_twelve_days_of_data_shows_messages_not_errors(tmp_path, monkeypatch):
+    path = tmp_path / "short.db"
+    monkeypatch.setattr(db, "DB_PATH", path)
+    monkeypatch.setattr(simulator, "DB_PATH", path)
+    db.init_db()
+    store.add_spec("PE100 SDR11 110mm", "wall_thickness", 10.0, 11.1, 10.4, "mm")
+    simulator.load_demo_data()
+    conn = db.get_connection()
+    first = pd.Timestamp(conn.execute("SELECT MIN(timestamp) FROM measurements").fetchone()[0])
+    cut = str(first + pd.Timedelta(days=12))
+    for name in ("measurements", "process_log"):
+        conn.execute(f"DELETE FROM {name} WHERE timestamp >= ?", (cut,))
+    conn.commit()
+    conn.close()
+    at = run_page("ai_insights")
+    assert not at.exception
+    assert any("more than 20 days" in i.value for i in at.info)
+    assert not [b for b in at.button if b.label == "Get advice"]
