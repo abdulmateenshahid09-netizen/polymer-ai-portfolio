@@ -71,6 +71,11 @@ def shift_of(ts):
     return "Night"
 
 
+def _tidy_columns(df):
+    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
+    return df
+
+
 def read_file(path):
     path = Path(path)
     if path.suffix.lower() in (".xlsx", ".xls"):
@@ -79,8 +84,19 @@ def read_file(path):
         df = pd.read_csv(path)
     else:
         raise ValueError("Use a .csv or .xlsx file")
-    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
-    return df
+    return _tidy_columns(df)
+
+
+def read_upload(uploaded):
+    """Read a file uploaded in the app (it has a .name and can be read like a file)."""
+    name = uploaded.name.lower()
+    if name.endswith((".xlsx", ".xls")):
+        df = pd.read_excel(uploaded)
+    elif name.endswith(".csv"):
+        df = pd.read_csv(uploaded)
+    else:
+        raise ValueError("Use a .csv or .xlsx file")
+    return _tidy_columns(df)
 
 
 def validate(df, table):
@@ -139,10 +155,15 @@ def validate(df, table):
 
 
 def import_file(path, table):
+    return import_dataframe(read_file(path), table)
+
+
+def import_dataframe(raw, table):
+    """Validate and store the rows of a table of records. Returns a summary dict."""
     if table not in COLUMNS:
         raise ValueError(f"Table must be one of: {', '.join(COLUMNS)}")
     init_db()
-    df, problems = validate(read_file(path), table)
+    df, problems = validate(raw, table)
     total_rows = len(df) + len(problems)
 
     conn = get_connection()
