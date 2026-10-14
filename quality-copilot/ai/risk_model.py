@@ -105,3 +105,22 @@ def feature_importance(model):
     """Which inputs the model leaned on (gain), largest first."""
     imp = pd.Series(model.feature_importances_, index=FEATURES)
     return imp.sort_values(ascending=False)
+
+
+def compare_verdict(table, margin=0.02):
+    """Does the model beat the best simple rule by a clear margin on BOTH AUC and avg precision?
+
+    table: rows 'XGBoost model' first, then the naive rules, with columns AUC and avg precision.
+    Returns (True / False / None, plain-language text). None = cannot be judged.
+    """
+    model, naive = table.iloc[0], table.iloc[1:]
+    best_auc, best_ap = naive["AUC"].max(), naive["avg precision"].max()
+    if pd.isna(model["AUC"]) or pd.isna(best_auc):
+        return None, "The test period has only one kind of outcome, so the model cannot be judged."
+    beats = bool(model["AUC"] >= best_auc + margin and model["avg precision"] >= best_ap + margin)
+    text = (f"Model AUC {model['AUC']:.2f} and average precision {model['avg precision']:.2f}; "
+            f"best simple rule AUC {best_auc:.2f} and average precision {best_ap:.2f}.")
+    if beats:
+        return True, "On this data the model beats the simple rules by a clear margin. " + text
+    return False, ("On this data the model does NOT clearly beat the simple rules, so treat its "
+                   "score as a second opinion, not as a better warning. " + text)

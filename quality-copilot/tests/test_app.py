@@ -168,3 +168,29 @@ def test_ai_insights_shows_anomalies_for_each_line(demo_db):
     at.sidebar.selectbox(key="flt_line").select("Line 1").run()
     assert not at.exception
     assert len(at.get("plotly_chart")) == 1
+
+def test_ai_insights_risk_section_is_honest_about_the_model(demo_db):
+    at = run_page("ai_insights")
+    assert not at.exception
+    tables = [d.value for d in at.dataframe if "method" in d.value.columns]
+    assert len(tables) == 1
+    assert list(tables[0]["method"]) == ["XGBoost model", "naive |z|", "naive |rolling mean|"]
+    assert any("does NOT clearly beat" in w.value for w in at.warning)   # demo data: no better
+    latest = [d.value for d in at.dataframe if "risk score" in d.value.columns][0]
+    assert set(latest["line"]) == {"Line 1", "Line 2"}
+    assert latest["risk score"].between(0, 1).all()
+
+
+def test_ai_insights_with_too_few_readings_shows_messages_not_errors(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "small.db")
+    db.init_db()
+    store.add_spec("PE100 SDR11 110mm", "wall_thickness", 10.0, 11.1, 10.4, "mm")
+    start = pd.Timestamp("2026-01-01 06:00")
+    for i in range(60):
+        ok, _ = store.add_measurement(start + pd.Timedelta(minutes=30 * i), "Line 1",
+                                      "PE100 SDR11 110mm", "wall_thickness", 10.4 + 0.01 * (i % 5))
+        assert ok
+    at = run_page("ai_insights")
+    assert not at.exception
+    assert any("At least" in i.value for i in at.info)         # anomaly section: not enough readings
+    assert any("No process settings" in i.value for i in at.info)   # risk section: no process log
